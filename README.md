@@ -58,28 +58,11 @@ Este proyecto es un overlay externo para CS2 que proporciona funcionalidades de 
 - **Thread-Safe**: Operaciones de memoria con mutex para seguridad
 - **Anti-Detection**: Ofuscación de código y técnicas de protección
 
-## Estructura del Proyecto
-
-```
-├── main.cpp              
-├── features/             
-│   ├── config.h         
-│   ├── esp.cpp/h        
-├── overlay/             
-│   ├── dx11_renderer.cpp/h
-├── memory/              
-│   ├── process.cpp/h
-│   ├── read.cpp/h
-├── sdk/                 
-│   ├── math.h
-│   └── offsets.h
-└── protection/          
-```
-
-
 ## Notas
 
-- Este proyecto es solo con fines educativos por eso no esat subido
+- Este proyecto es solo con fines educativos por eso no esta subido
+
+
 <img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/a1ba52ec-5f62-4a3d-bac6-174664e85655" />
 
 

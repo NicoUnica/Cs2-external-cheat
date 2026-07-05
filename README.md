@@ -60,7 +60,7 @@ Este proyecto es un overlay externo para CS2 que proporciona funcionalidades de 
 
 ## Notas
 
-- Este proyecto es solo con fines educativos por eso no esta subido
+- Este proyecto es solo con fines educativos
 
 
 <img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/ae363782-2c04-4ca3-822d-4574117197b6" />

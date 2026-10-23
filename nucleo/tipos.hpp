@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <array>
 #include <utility>
+#include <algorithm>
 
 // Vector 2D para coordenadas de pantalla
 struct Vector2 {
@@ -42,13 +43,13 @@ struct DatosJugador {
   bool estaVivo;
   bool esValido;
   Vector3 origen;
+  std::uint64_t posicionLeidaEn=0;
   char nombre[128];
   char nombreArma[128];
   float distancia;
   int dinero;
   bool cegado=false;
   int armadura=-1;
-  std::uint64_t sonidoEn=0;
   bool casco=false,kit=false,desactivando=false,inmune=false,recargando=false;
   std::uint16_t armaId=0;
   int balasCargador=-1,balasReserva=-1;
@@ -57,7 +58,6 @@ struct DatosJugador {
 
 // Los huesos pertenecen al cuadro de dibujo, no a los datos compartidos entre hilos.
 struct PoseJugador {
-  uintptr_t escena=0;
   Vector3 posicionesHuesos[24]{};
 };
 inline bool MuestraReciente(std::uint64_t leidoEn,std::uint64_t ahora,std::uint64_t limite=300) {
@@ -66,6 +66,8 @@ inline bool MuestraReciente(std::uint64_t leidoEn,std::uint64_t ahora,std::uint6
 
 // Datos del jugador local
 struct JugadorLocal {
+  uintptr_t controlador=0;
+  std::uint8_t modoObservacion=0;
   uintptr_t personaje;
   int salud;
   uint8_t equipo;
@@ -91,11 +93,9 @@ enum IndiceHueso : int {
     COLUMNA2 = 4,
     CUELLO = 6,
     CABEZA = 7,
-    CLAVICULA_IZQUIERDA = 8,
     HOMBRO_IZQUIERDO = 9,
     CODO_IZQUIERDO = 10,
     MANO_IZQUIERDA = 11,
-    CLAVICULA_DERECHA = 12,
     HOMBRO_DERECHO = 13,
     CODO_DERECHO = 14,
     MANO_DERECHA = 15,
@@ -104,9 +104,7 @@ enum IndiceHueso : int {
     TALON_IZQUIERDO = 19,
     CADERA_DERECHA = 20,
     RODILLA_DERECHA = 21,
-    TALON_DERECHO = 22,
-    PUNTA_IZQUIERDA = 24,
-    PUNTA_DERECHA = 25
+    TALON_DERECHO = 22
 };
 
 // Convertir coordenadas 3D del mundo a 2D de pantalla
@@ -153,7 +151,38 @@ inline constexpr auto HuesosUsados=[] {
 static_assert(CantidadHuesos==sizeof(PoseJugador{}.posicionesHuesos)/sizeof(Vector3));
 }
 
+inline bool PosicionMundoValida(Vector3 p) {
+    return std::isfinite(p.x)&&std::isfinite(p.y)&&std::isfinite(p.z)&&!p.EsCero()&&
+        std::abs(p.x)<100000.f&&std::abs(p.y)<100000.f&&std::abs(p.z)<100000.f;
+}
+
 namespace optimizacion {
+struct RastroMovimiento {
+    struct Punto { Vector3 posicion{}; std::uint64_t instante=0; };
+    std::array<Punto,32> puntos{};
+    std::size_t cantidad=0;
+    uintptr_t personaje=0,controlador=0;
+    std::uint64_t ultimaMuestra=0;
+    void Actualizar(const DatosJugador& jugador,std::uint64_t ahora,bool activo) {
+        if(!activo||!jugador.esValido||!jugador.estaVivo||!PosicionMundoValida(jugador.origen)||
+            !MuestraReciente(jugador.posicionLeidaEn,ahora)) { *this={}; return; }
+        const auto instante=jugador.posicionLeidaEn;
+        if(personaje!=jugador.personaje||controlador!=jugador.controlador||instante<ultimaMuestra||
+            (ultimaMuestra&&instante-ultimaMuestra>300)) *this={};
+        personaje=jugador.personaje; controlador=jugador.controlador;
+        if(cantidad) {
+            const auto diferencia=jugador.origen-puntos[cantidad-1].posicion;
+            if(diferencia.x*diferencia.x+diferencia.y*diferencia.y+diferencia.z*diferencia.z>256.f*256.f) { cantidad=0; ultimaMuestra=0; }
+        }
+        std::size_t comienzo=0;
+        while(comienzo<cantidad&&ahora-puntos[comienzo].instante>1200) ++comienzo;
+        if(comienzo) { for(std::size_t i=comienzo;i<cantidad;++i) puntos[i-comienzo]=puntos[i]; cantidad-=comienzo; }
+        if(ultimaMuestra&&instante-ultimaMuestra<40) return;
+        ultimaMuestra=instante;
+        if(cantidad==puntos.size()) { for(std::size_t i=1;i<cantidad;++i) puntos[i-1]=puntos[i]; --cantidad; }
+        puntos[cantidad++]={jugador.origen,instante};
+    }
+};
 inline float DistanciaCuadrada(Vector3 a,Vector3 b) {
     const auto d=a-b; return d.x*d.x+d.y*d.y+d.z*d.z;
 }

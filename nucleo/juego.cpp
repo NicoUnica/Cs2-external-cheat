@@ -1,5 +1,4 @@
 #include "juego.hpp"
-#include "errores.hpp"
 #include <TlHelp32.h>
 #include <Psapi.h>
 #include "tipos.hpp"
@@ -17,11 +16,10 @@
 #include <mutex>
 #include <thread>
 #include <condition_variable>
-#include <string_view>
 
 namespace {
 // Separar la vista del personaje evita apagar el ESP al morir.
-// Los lectores se inyectan para comprobar cambios de observación sin ejecutar el juego.
+// La vista observada conserva su propio origen y equipo.
 template<class Lector,class Resolver>
 void ActualizarVistaJugador(JugadorLocal& local,uintptr_t controlador,Lector&& leer,Resolver&& resolver) {
     local.personajeVista=0; local.origenVista={}; local.equipoVista=0; local.vistaValida=false;
@@ -35,9 +33,10 @@ void ActualizarVistaJugador(JugadorLocal& local,uintptr_t controlador,Lector&& l
         const auto observador=resolver(LeerHandle(controlador+campos::personajeObservador));
         const auto fuente=observador ? observador : local.personaje;
         const auto servicio=fuente ? LeerPuntero(fuente+campos::servicioObservacion) : 0;
-        // ObserverMode_t del volcado 14191: InEye=2, Chase=3, Roaming=4.
+        // Modos de observación del volcado: primera persona=2, seguimiento=3, cámara libre=4.
         uint8_t modo=0;
         if(servicio&&leer(servicio+campos::modoObservacion,modo)) {
+            local.modoObservacion=modo;
             uintptr_t vista=0;
             if(modo==2||modo==3) {
                 vista=resolver(LeerHandle(servicio+campos::objetivoObservacion));
@@ -55,29 +54,6 @@ void ActualizarVistaJugador(JugadorLocal& local,uintptr_t controlador,Lector&& l
             }
         }
     }
-}
-
-namespace juego {
-inline std::string NombreMapa(std::string_view ruta) {
-    if(ruta.empty()||ruta.size()>127||!MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,ruta.data(),static_cast<int>(ruta.size()),nullptr,0)) return {};
-    for(const unsigned char c:ruta) if(c<32||c==127) return {};
-    std::string nombre(ruta);std::replace(nombre.begin(),nombre.end(),'\\','/');
-    for(std::size_t i=0;i<nombre.size();) {
-        const auto fin=nombre.find('/',i);
-        if(nombre.substr(i,fin==std::string::npos ? fin : fin-i)=="..") return {};
-        if(fin==std::string::npos) break;i=fin+1;
-    }
-    const auto separacion=nombre.find_last_of('/');
-    if(separacion!=std::string::npos) nombre.erase(0,separacion+1);
-    if(nombre.ends_with(".vpk")||nombre.ends_with(".bsp")) nombre.resize(nombre.size()-4);
-    if(nombre.empty()||nombre=="."||nombre=="<empty>"||nombre=="empty"||nombre=="mainmenu"||nombre.ends_with("_vanity")) return {};
-    if(nombre=="de_dust2") return "Dust 2";
-    for(const auto prefijo:{"de_","cs_","ar_","gd_","dz_"}) if(nombre.starts_with(prefijo)) {nombre.erase(0,3);break;}
-    if(nombre.empty()) return {};
-    std::replace(nombre.begin(),nombre.end(),'_',' ');
-    if(nombre[0]>='a'&&nombre[0]<='z') nombre[0]-='a'-'A';
-    return nombre;
-}
 }
 
 namespace validacion {
@@ -125,7 +101,7 @@ public:
 };
 }
 
-// Obtener ID del proceso por nombre
+// Obtener el identificador del proceso por su nombre
 static DWORD BuscarProceso(const wchar_t *nombreProceso) {
   DWORD identificadorProceso = 0;
   if (!nombreProceso || !*nombreProceso) return 0;
@@ -185,33 +161,33 @@ static uintptr_t BuscarModulo(HANDLE proceso, const wchar_t *nombreModulo) {
 }
 
 // Inicializar la lectura del juego y obtener los recursos del proceso.
-bool IniciarMemoria() {
+ResultadoMemoria IniciarMemoria() {
   LiberarMemoria();
   DWORD identificadorProceso = BuscarProceso(L"cs2.exe");
   if (!identificadorProceso) {
 
-    return false;
+    return ResultadoMemoria::EsperandoProceso;
   }
 
   procesoJuego = AbrirProcesoJuego(identificadorProceso);
   if (!procesoJuego || procesoJuego == INVALID_HANDLE_VALUE) {
-    return false;
+    return ResultadoMemoria::SinAcceso;
   }
 
   baseCliente = BuscarModulo(procesoJuego, L"client.dll");
   if (!baseCliente) {
 
     LiberarMemoria();
-    return false;
+    return ResultadoMemoria::EsperandoModulos;
   }
   baseMotor=BuscarModulo(procesoJuego,L"engine2.dll");
   int compilacion=0;
   if(!baseMotor||!LeerSeguro(baseMotor+direcciones::globales::motor::compilacion,compilacion)) {
-    LiberarMemoria(); return false;
+    LiberarMemoria(); return ResultadoMemoria::EsperandoModulos;
   }
   if(compilacion!=direcciones::globales::motor::compilacionEsperada) {
 
-    LiberarMemoria(); return false;
+    LiberarMemoria(); return ResultadoMemoria::VersionIncompatible;
   }
 
   {
@@ -243,15 +219,17 @@ bool IniciarMemoria() {
   if (!ventanaJuego) {
 
     LiberarMemoria();
-    return false;
+    return ResultadoMemoria::EsperandoVentana;
   }
 
   RECT cliente{};
   if(GetClientRect(ventanaJuego,&cliente)&&cliente.right>0&&cliente.bottom>0) {
     anchoPantalla=cliente.right; altoPantalla=cliente.bottom;
   }
-  return true;
+  return ResultadoMemoria::Disponible;
 }
+
+
 
 // Limpiar recursos de memoria
 void LiberarMemoria() {
@@ -263,54 +241,43 @@ void LiberarMemoria() {
   ventanaJuego = nullptr;
 }
 
-DatosJugador jugadoresGlobales[65] = {};
-JugadorLocal jugadorLocalGlobal = {};
-std::vector<std::string> espectadoresGlobales;
-std::mutex mutexDatos;
-std::uint64_t datosLeidosEn=0,espectadoresLeidosEn=0;
+static DatosJugador jugadoresGlobales[65] = {};
+static JugadorLocal jugadorLocalGlobal = {};
+static std::vector<std::string> espectadoresGlobales;
+static std::mutex mutexDatos;
+static std::uint64_t datosLeidosEn=0,espectadoresLeidosEn=0;
 static std::atomic<bool> juegoPausado{false};
-static std::atomic<EstadoPartida> estadoPartida{EstadoPartida::Fuera};
-static std::mutex mutexPartida;
-static InformacionPartida informacionPartida;
-static void PublicarEstadoPartida(EstadoPartida estado,const std::string& mapa={},std::uint64_t comprobadaEn=0) {
-    std::lock_guard<std::mutex> bloqueo(mutexPartida);
-    informacionPartida={estado,mapa,comprobadaEn};
-    estadoPartida.store(estado,std::memory_order_relaxed);
-}
-InformacionPartida CopiarInformacionPartida() {
-    std::lock_guard<std::mutex> bloqueo(mutexPartida);
-    auto informacion=informacionPartida;
-    if(JuegoEnPausa()) {informacion.estado=EstadoPartida::Pausado;informacion.mapa.clear();}
-    else if(informacion.estado!=EstadoPartida::Fuera&&(!informacion.comprobadaEn||GetTickCount64()-informacion.comprobadaEn>1500)) {
-        informacion.estado=EstadoPartida::Desconocido;informacion.mapa.clear();
-    }
-    return informacion;
+static std::atomic<bool> visualesActivos{true};
+bool VisualesActivos() { return visualesActivos.load(std::memory_order_relaxed); }
+// Estado y antigüedad se publican en una única operación coherente.
+static std::atomic<std::uint64_t> estadoPartida{0};
+static_assert(static_cast<unsigned>(EstadoPartida::Desconocido)<8);
+static EstadoPartida EstadoPublicado() { return static_cast<EstadoPartida>(estadoPartida.load(std::memory_order_relaxed)&7u); }
+static void PublicarEstadoPartida(EstadoPartida estado,std::uint64_t comprobadaEn=0) {
+    estadoPartida.store((comprobadaEn<<3)|static_cast<std::uint64_t>(estado),std::memory_order_relaxed);
 }
 static EstadoPartida ObtenerEstadoPartida() {
-    return JuegoEnPausa() ? EstadoPartida::Pausado : estadoPartida.load(std::memory_order_relaxed);
+    if(JuegoEnPausa()||!VisualesActivos()) return EstadoPartida::Pausado;
+    const auto publicado=estadoPartida.load(std::memory_order_relaxed);
+    const auto estado=static_cast<EstadoPartida>(publicado&7u);
+    const auto comprobadoEn=publicado>>3;
+    if(estado!=EstadoPartida::Fuera&&(!comprobadoEn||GetTickCount64()-comprobadoEn>1500)) return EstadoPartida::Desconocido;
+    return estado;
 }
 bool PartidaActiva() {
     const auto estado=ObtenerEstadoPartida();
     return estado==EstadoPartida::Jugando||estado==EstadoPartida::Espectando;
 }
-std::string TextoEstadoPartida() {
-    const auto informacion=CopiarInformacionPartida();
-    std::string texto;
-    switch(informacion.estado) {
-    case EstadoPartida::Jugando: texto="Jugando";break;
-    case EstadoPartida::Espectando: texto="Espectando";break;
-    case EstadoPartida::EnPartida: texto="En partida";break;
-    case EstadoPartida::Cargando: texto="Cargando partida";break;
-    case EstadoPartida::Pausado: texto="En pausa";break;
-    case EstadoPartida::Desconocido: texto="Estado no disponible";break;
-    default: texto="Fuera de partida";break;
-    }
-    if(!informacion.mapa.empty()) texto+=" · "+informacion.mapa;
-    else if(informacion.estado==EstadoPartida::EnPartida||informacion.estado==EstadoPartida::Jugando||informacion.estado==EstadoPartida::Espectando) texto+=" · Mapa no disponible";
-    return texto;
-}
+
 static std::mutex mutexSuspension;
 static std::condition_variable despertarLector;
+void EstablecerVisualesActivos(bool activos) {
+    {
+        std::lock_guard<std::mutex> bloqueo(mutexSuspension);
+        visualesActivos.store(activos,std::memory_order_relaxed);
+    }
+    despertarLector.notify_all();
+}
 void EstablecerPausa(bool enPausa) {
     if(juegoPausado.load(std::memory_order_relaxed)==enPausa) return;
     {
@@ -320,8 +287,15 @@ void EstablecerPausa(bool enPausa) {
     despertarLector.notify_all();
 }
 bool JuegoEnPausa() { return juegoPausado.load(std::memory_order_relaxed); }
-bool CopiarDatosJuego(JugadorLocal& local,std::array<DatosJugador,65>* jugadores) {
+void CopiarEspectadores(std::vector<std::string>& nombres,std::uint64_t& ultimaMuestra) {
     std::lock_guard<std::mutex> bloqueo(mutexDatos);
+    if(MuestraReciente(espectadoresLeidosEn,GetTickCount64(),600)) {
+        if(ultimaMuestra!=espectadoresLeidosEn) { nombres=espectadoresGlobales; ultimaMuestra=espectadoresLeidosEn; }
+    } else { nombres.clear(); ultimaMuestra=0; }
+}
+bool CopiarDatosJuego(JugadorLocal& local,std::array<DatosJugador,65>* jugadores,std::uint64_t* muestra) {
+    std::lock_guard<std::mutex> bloqueo(mutexDatos);
+    if(muestra) *muestra=datosLeidosEn;
     if (!MuestraReciente(datosLeidosEn,GetTickCount64())) {
         local={}; if (jugadores) *jugadores={}; return false;
     }
@@ -339,21 +313,18 @@ std::uint32_t LecturasActivas() { return static_cast<std::uint32_t>(opcionesLect
 float DistanciaObjetosActiva() { return std::bit_cast<float>(static_cast<std::uint32_t>(opcionesLectura.load(std::memory_order_relaxed)>>32)); }
 static int IntervaloLecturas() { return intervaloLecturas.load(std::memory_order_relaxed); }
 void EstablecerLecturas(std::uint32_t opciones,int frecuencia,float distanciaObjetos) {
-    if(!std::isfinite(distanciaObjetos)) distanciaObjetos=60.f;
-    distanciaObjetos=std::clamp(distanciaObjetos,5.f,120.f);
-    frecuencia=std::clamp(frecuencia,10,250);
-    opciones&=0x0FFFFFFFu;
-    const auto dependientes=lecturas::Nombre|lecturas::Arma|lecturas::Apuntado|lecturas::Portador|
-        lecturas::Dinero|lecturas::Ceguera|lecturas::Armadura|lecturas::Kit|lecturas::Desactivando|
-        lecturas::Inmunidad|lecturas::Recarga|lecturas::PosicionRapida|lecturas::Sonido;
-    if(opciones&dependientes) opciones|=lecturas::Jugadores;
-    if(opciones&lecturas::TiempoGranadas) opciones|=lecturas::GranadasMundo;
-    intervaloLecturas.store(std::clamp((1000+frecuencia-1)/frecuencia,4,100),std::memory_order_relaxed);
-    const auto distancia=static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(distanciaObjetos));
-    opcionesLectura.store((distancia<<32)|opciones,std::memory_order_relaxed);
+    const auto hz=std::clamp(frecuencia,10,250);
+    intervaloLecturas.store((1000+hz-1)/hz,std::memory_order_relaxed);
+    const float metros=std::isfinite(distanciaObjetos) ? std::clamp(distanciaObjetos,1.f,10000.f) : 60.f;
+    const auto distancia=static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(metros));
+    opcionesLectura.store((distancia<<32)|(opciones&0x0FFFFFFFu),std::memory_order_relaxed);
+}
+bool LeerOrigenMundo(uintptr_t entidad,Vector3& origen) {
+    const auto escena=Leer<uintptr_t>(entidad+campos::nodoEscena);
+    return escena&&LeerSeguro(escena+campos::origenAbsoluto,origen)&&PosicionMundoValida(origen);
 }
 bool LeerBloque(uintptr_t direccion,void* salida,std::size_t tamano) {
-    if (!salida || !tamano || !direccion || !procesoJuego || procesoJuego==INVALID_HANDLE_VALUE ||
+    if (!VisualesActivos()||!salida || !tamano || !direccion || !procesoJuego || procesoJuego==INVALID_HANDLE_VALUE ||
         tamano-1>UINTPTR_MAX-direccion) return false;
     SIZE_T bytes=0;
     const bool correcto=ReadProcessMemory(procesoJuego,reinterpret_cast<LPCVOID>(direccion),salida,tamano,&bytes) && bytes==tamano;
@@ -377,6 +348,15 @@ bool LeerTexto(uintptr_t direccion,char* salida,std::size_t capacidad) {
 }
 static std::atomic<uintptr_t> separacionEntidades{0x70};
 uintptr_t SeparacionEntidades() { return separacionEntidades.load(); }
+namespace {
+thread_local lecturas::PaginasEntidades paginasActuales;
+uintptr_t PaginaEntidades(uintptr_t lista,std::size_t indice) {
+    return paginasActuales.Obtener(lista,indice,[](uintptr_t direccion) { return Leer<uintptr_t>(direccion); });
+}
+}
+bool LeerMunicionArma(uintptr_t arma,int& cargador,int& reserva) {
+    return lecturas::LeerMunicion(arma,cargador,reserva,[](uintptr_t direccion,auto& datos) { return LeerSeguro(direccion,datos); });
+}
 static void ValidarListaEntidades(uintptr_t lista,uintptr_t controlador) {
     static ULONGLONG comprobadoEn=0;
     static uintptr_t listaAnterior=0,controladorAnterior=0;
@@ -385,7 +365,7 @@ static void ValidarListaEntidades(uintptr_t lista,uintptr_t controlador) {
     if(lista!=listaAnterior||controlador!=controladorAnterior) { comprobadoEn=0; indiceAnterior=0; listaAnterior=lista; controladorAnterior=controlador; }
     if (!controlador||ahora-comprobadoEn<1000) return;
     comprobadoEn=ahora;
-    const auto bloqueEntidades=Leer<uintptr_t>(lista+0x10);
+    const auto bloqueEntidades=PaginaEntidades(lista,0);
     if (!bloqueEntidades) return;
     if(indiceAnterior&&Leer<uintptr_t>(bloqueEntidades+SeparacionEntidades()*indiceAnterior)==controlador) return;
     std::array<std::byte,64*0x78+sizeof(uintptr_t)> bloque{};
@@ -400,7 +380,7 @@ static void ValidarListaEntidades(uintptr_t lista,uintptr_t controlador) {
 static uintptr_t ResolverEntidad(std::uint32_t control,uintptr_t lista) {
     if (!lista||!control||control==0xFFFFFFFF) return 0;
     const auto indice=control&0x7FFF;
-    const auto bloqueEntidades=Leer<uintptr_t>(lista+0x10+8*(indice>>9));
+    const auto bloqueEntidades=PaginaEntidades(lista,indice>>9);
     return bloqueEntidades ? Leer<uintptr_t>(bloqueEntidades+SeparacionEntidades()*(indice&0x1FF)) : 0;
 }
 static std::uint16_t IdentificadorArma(uintptr_t arma) {
@@ -416,8 +396,6 @@ struct EntidadGuardada {
     std::uint16_t idArma=0;
     std::uint64_t idArmaLeidoEn=0;
     std::uint64_t nombreLeidoEn=0,informacionLeidaEn=0,inventarioLeidoEn=0,armaLeidaEn=0,datosLentosLeidosEn=0;
-    std::uint64_t sonidoLeidoEn=0,sonidoEn=0;
-    float ultimoSonido=0;
     std::uint64_t municionLeidaEn=0;
     int balasCargador=-1,balasReserva=-1;
 };
@@ -436,32 +414,14 @@ static void LeerNombreArma(uintptr_t entidadArma, char *salida, size_t longitudM
     const char *origenTexto = textoOriginal;
     if (strncmp(origenTexto, "weapon_", 7) == 0) origenTexto += 7;
 
-    struct { const char *origen; const char *destino; } equivalencias[] = {
-        {"ak47","AK-47"},{"m4a1","M4A4"},{"m4a1_silencer","M4A1-S"},
-        {"awp","AWP"},{"deagle","Desert Eagle"},{"glock","Glock-18"},
-        {"usp_silencer","USP-S"},{"hkp2000","P2000"},{"p250","P250"},
-        {"fiveseven","Five-SeveN"},{"tec9","Tec-9"},{"cz75a","CZ75-Auto"},
-        {"revolver","R8 Revolver"},{"elite","Dual Berettas"},
-        {"mp9","MP9"},{"mac10","MAC-10"},{"mp5sd","MP5-SD"},{"ump45","UMP-45"}
-    };
-    for (int i = 0; i < (sizeof(equivalencias)/sizeof(equivalencias[0])); i++) {
-        if (_stricmp(origenTexto, equivalencias[i].origen) == 0) {
-            strncpy_s(salida, longitudMaxima, equivalencias[i].destino, longitudMaxima-1);
-            return;
-        }
-    }
     strncpy_s(salida, longitudMaxima, origenTexto, longitudMaxima-1);
     if (salida[0] >= 'a' && salida[0] <= 'z') salida[0] -= 32;
 }
 
 static bool LlevaBomba(uintptr_t personaje,uintptr_t lista) {
-    const auto servicio=Leer<uintptr_t>(personaje+campos::servicioArmas);
-    int cantidad=0; uintptr_t data=0;
-    if (!servicio||!LeerSeguro(servicio+campos::inventarioArmas,cantidad)||cantidad<=0||cantidad>64||
-        !LeerSeguro(servicio+campos::inventarioArmas+8,data)||!data) return false;
+    int cantidad=0;
     std::array<std::uint32_t,64> identificadores{};
-    const auto tamano=static_cast<SIZE_T>(cantidad)*sizeof(std::uint32_t);
-    if (!LeerBloque(data,identificadores.data(),tamano)) return false;
+    if(!lecturas::LeerHandlesInventario(personaje,identificadores,cantidad,LeerBloque)) return false;
     for (int i=0;i<cantidad;++i) if (IdentificadorArma(ResolverEntidad(identificadores[i],lista))==49) return true;
     return false;
 }
@@ -501,9 +461,7 @@ static void LeerEstadoArma(DatosJugador& jugador,uintptr_t lista,std::uint32_t o
     if(armaConCargador&&(opciones&lecturas::Arma)) {
         if(!guardado.municionLeidaEn||ahora-guardado.municionLeidaEn>=100) {
             int cargador=-1,reserva=-1;
-            const bool valido=LeerSeguro(arma+campos::balasCargador,cargador)&&
-                LeerSeguro(arma+campos::balasReserva,reserva)&&
-                cargador>=0&&cargador<=250&&reserva>=0&&reserva<=1000;
+            const bool valido=LeerMunicionArma(arma,cargador,reserva);
             guardado.balasCargador=valido ? cargador : -1;
             guardado.balasReserva=valido ? reserva : -1;
             guardado.municionLeidaEn=ahora;
@@ -540,27 +498,11 @@ static void VaciarDatosJugadores() {
 // Sondeo ligero independiente de las opciones visuales; solo el lector escribe esta caché.
 struct SondeoPartida {
     std::uint64_t comprobadoEn=0;
-    std::uint64_t mapaLeidoEn=0;
     uintptr_t red=0;
-    std::string rutaMapa,nombreMapa;
     bool conectada=false;
     EstadoPartida estado=EstadoPartida::Fuera;
 };
 static SondeoPartida sondeoPartida;
-static void ActualizarNombreMapa(std::uint64_t ahora,bool forzar=false) {
-    if(!forzar&&sondeoPartida.mapaLeidoEn&&ahora-sondeoPartida.mapaLeidoEn<1000) return;
-    sondeoPartida.mapaLeidoEn=ahora;
-    uintptr_t variables=0,texto=0;char ruta[129]{};
-    const bool valida=LeerSeguro(baseCliente+direcciones::globales::cliente::variablesGlobales,variables)&&variables&&
-        LeerSeguro(variables+campos::nombreMapa,texto)&&texto&&LeerTexto(texto,ruta,sizeof(ruta));
-    const std::string nombre=valida ? juego::NombreMapa(ruta) : std::string{};
-    const std::string nuevaRuta=nombre.empty() ? std::string{} : std::string(ruta);
-    if(!sondeoPartida.rutaMapa.empty()&&nuevaRuta!=sondeoPartida.rutaMapa) {
-        PublicarEstadoPartida(EstadoPartida::EnPartida,{},ahora);
-        VaciarDatosJugadores();
-    }
-    sondeoPartida.rutaMapa=nuevaRuta;sondeoPartida.nombreMapa=nombre;
-}
 static bool ComprobarPartida() {
     const auto ahora=GetTickCount64();
     const auto intervalo=sondeoPartida.conectada ? 100ULL : 250ULL;
@@ -576,22 +518,16 @@ static bool ComprobarPartida() {
     sondeoPartida.conectada=valida&&conexion==6&&!fondo;
     sondeoPartida.estado=!valida ? EstadoPartida::Desconocido : fondo||conexion==0 ? EstadoPartida::Fuera :
         sondeoPartida.conectada ? EstadoPartida::EnPartida : EstadoPartida::Cargando;
-    if(sondeoPartida.conectada) {
-        if(cambioConexion&&conectadaAntes) {
-            PublicarEstadoPartida(EstadoPartida::EnPartida,{},ahora);VaciarDatosJugadores();
-            sondeoPartida.rutaMapa.clear();sondeoPartida.nombreMapa.clear();
-        }
-        ActualizarNombreMapa(ahora,!conectadaAntes||cambioConexion);
-    } else {
-        sondeoPartida.rutaMapa.clear();sondeoPartida.nombreMapa.clear();sondeoPartida.mapaLeidoEn=0;
+    if(sondeoPartida.conectada&&cambioConexion&&conectadaAntes) {
+        PublicarEstadoPartida(EstadoPartida::EnPartida,ahora); VaciarDatosJugadores();
     }
     return sondeoPartida.conectada;
 }
 
 static void InvalidarPartida() {
     // Impedir nuevas lecturas desde el dibujo antes de retirar las muestras publicadas.
-    const auto anterior=estadoPartida.load(std::memory_order_relaxed);
-    PublicarEstadoPartida(sondeoPartida.estado,sondeoPartida.nombreMapa,sondeoPartida.comprobadoEn);
+    const auto anterior=EstadoPublicado();
+    PublicarEstadoPartida(sondeoPartida.estado,sondeoPartida.comprobadoEn);
     if(anterior==EstadoPartida::Jugando||anterior==EstadoPartida::Espectando) VaciarDatosJugadores();
 }
 
@@ -607,30 +543,29 @@ static void ActualizarJugadores() {
 
     uintptr_t controladorLocal = Leer<uintptr_t>(baseCliente + direcciones::globales::cliente::controladorLocal);
     uintptr_t personajeLocal = Leer<uintptr_t>(baseCliente + direcciones::globales::cliente::personajeLocal);
+    paginasActuales.Reiniciar(listaEntidades);
     ValidarListaEntidades(listaEntidades,controladorLocal);
     const auto ahora=GetTickCount64();
     static std::uint32_t opcionesAnteriores=0;
     const bool opcionesCambiadas=opciones!=opcionesAnteriores;
     opcionesAnteriores=opciones;
 
-    struct EstadoSalud { int salud; char relleno[4]; std::uint8_t vida; };
-    static_assert(campos::estadoVida-campos::salud==offsetof(EstadoSalud,vida));
+    using EstadoSalud=lecturas::EstadoBasico;
     JugadorLocal local = {};
+    local.controlador=controladorLocal;
     if (personajeLocal && controladorLocal) {
         local.personaje = personajeLocal;
         EstadoSalud estadoLocal{};
         const bool saludLeida=LeerSeguro(personajeLocal+campos::salud,estadoLocal);
         local.salud=saludLeida ? estadoLocal.salud : 0;
+        local.equipo=saludLeida ? estadoLocal.equipo : 0;
         uint8_t personajeVivo=0;
         local.esValido = (saludLeida && local.salud > 0 && local.salud <= 100 &&
             LeerSeguro(controladorLocal+campos::personajeVivo,personajeVivo)&&personajeVivo==1&&
             estadoLocal.vida==0&&
-            LeerSeguro(personajeLocal + campos::equipo, local.equipo) &&
+            local.equipo<=3 &&
             LeerSeguro(personajeLocal + campos::origenAnterior, local.origen) &&
             std::isfinite(local.origen.x) && std::isfinite(local.origen.y) && std::isfinite(local.origen.z));
-        std::uint8_t apuntando=0;
-        local.apuntadoLeido=(opciones&lecturas::Awp)&&LeerSeguro(personajeLocal+campos::apuntando,apuntando)&&apuntando<=1;
-        local.estaApuntando=local.apuntadoLeido&&apuntando!=0;
         if(opciones&lecturas::Awp) {
             auto& guardado=armaLocalGuardada;
             if(guardado.personaje!=personajeLocal||guardado.lista!=listaEntidades||opcionesCambiadas) {
@@ -644,15 +579,21 @@ static void ActualizarJugadores() {
                 }
             }
             local.identificadorArma=guardado.id;
+            if(local.esValido&&(guardado.id==9||guardado.id==40)) {
+                std::uint8_t apuntando=0;
+                local.apuntadoLeido=LeerSeguro(personajeLocal+campos::apuntando,apuntando)&&apuntando<=1;
+                local.estaApuntando=local.apuntadoLeido&&apuntando!=0;
+            }
         } else armaLocalGuardada={};
     }
 
     ActualizarVistaJugador(local,controladorLocal,
         [](uintptr_t direccion,auto& valor) { return LeerSeguro(direccion,valor); },
         [listaEntidades](uint32_t handle) { return ResolverEntidad(handle,listaEntidades); });
+    if(!(opciones&lecturas::ObservacionAutomatica)&&!local.esValido) local.equipoVista=local.equipo;
 
     if(!local.vistaValida) { InvalidarPartida(); return; }
-    PublicarEstadoPartida(local.esValido ? EstadoPartida::Jugando : EstadoPartida::Espectando,sondeoPartida.nombreMapa,sondeoPartida.comprobadoEn);
+    PublicarEstadoPartida(local.esValido ? EstadoPartida::Jugando : EstadoPartida::Espectando,sondeoPartida.comprobadoEn);
 
     if (!(opciones&lecturas::Jugadores)) {
         std::lock_guard<std::mutex> bloqueo(mutexDatos);
@@ -673,7 +614,7 @@ static void ActualizarJugadores() {
 
     DatosJugador jugadoresNuevos[65] = {};
     baseEspectadores={};
-    const uintptr_t entrada=Leer<uintptr_t>(listaEntidades+0x10);
+    const uintptr_t entrada=PaginaEntidades(listaEntidades,0);
     const auto separacion=SeparacionEntidades();
     std::array<std::byte,64*256> controladores;
     const bool bloqueValido=entrada&&separacion>=sizeof(uintptr_t)&&separacion<=256&&
@@ -698,7 +639,7 @@ static void ActualizarJugadores() {
             personaje = entidadesGuardadas[i].direccionPersonaje;
         } else {
             uint32_t indicePersonaje = identificadorPersonaje & 0x7FFF;
-            uintptr_t entradaPersonaje = (indicePersonaje>>9)==0 ? entrada : Leer<uintptr_t>(listaEntidades + 0x10 + 8 * (indicePersonaje >> 9));
+            uintptr_t entradaPersonaje = (indicePersonaje>>9)==0 ? entrada : PaginaEntidades(listaEntidades,indicePersonaje>>9);
             if (entradaPersonaje) {
                 personaje = Leer<uintptr_t>(entradaPersonaje + SeparacionEntidades() * (indicePersonaje & 0x1FF));
                 entidadesGuardadas[i] = {identificadorPersonaje, personaje, controlador};
@@ -716,7 +657,8 @@ static void ActualizarJugadores() {
             p.estaVivo = (b1.vida == 0 && b1.salud > 0);
             p.esValido = (b1.salud > 0 && b1.salud <= 100);
         }
-        if (!LeerSeguro(personaje + campos::equipo, p.equipo)) {
+        p.equipo=b1.equipo;
+        if (!estadoLeido||p.equipo>3) {
             p.esValido = false;
             continue;
         }
@@ -732,20 +674,9 @@ static void ActualizarJugadores() {
             continue;
         }
         if (local.vistaValida) p.distancia = Distancia3D(local.origenVista, p.origen);
+        p.posicionLeidaEn=ahora;
 
         auto& guardado=entidadesGuardadas[i];
-        if(opciones&lecturas::Sonido) {
-            if(!guardado.sonidoLeidoEn||ahora-guardado.sonidoLeidoEn>=30) {
-                float instante=0;
-                if(LeerSeguro(personaje+campos::instanteSonido,instante)&&std::isfinite(instante)&&instante>=0.f) {
-                    if(guardado.ultimoSonido>0.f&&instante>guardado.ultimoSonido)
-                        guardado.sonidoEn=ahora;
-                    guardado.ultimoSonido=instante;
-                }
-                guardado.sonidoLeidoEn=ahora;
-            }
-            p.sonidoEn=guardado.sonidoEn;
-        }
         if (mismoJugador) {
             if (opciones&lecturas::Nombre) strncpy_s(p.nombre,jugadoresAnteriores[i].nombre,sizeof(p.nombre)-1);
             if (opciones&lecturas::Arma) strncpy_s(p.nombreArma,jugadoresAnteriores[i].nombreArma,sizeof(p.nombreArma)-1);
@@ -781,19 +712,24 @@ static void ActualizarJugadores() {
                 p.dinero=dinero ? Leer<int>(dinero+campos::cuentaDinero) : 0;
             }
             p.armadura=-1; p.casco=false; p.kit=false;
-            if(opciones&(lecturas::Armadura|lecturas::Kit)) {
+            if(opciones&lecturas::Armadura) {
+                int valor=-1;
+                if(LeerSeguro(personaje+campos::armadura,valor)&&valor>=0&&valor<=100) p.armadura=valor;
+            }
+            if(opciones&(lecturas::Casco|lecturas::Kit)) {
                 const auto objetos=Leer<uintptr_t>(personaje+campos::servicioObjetos);
-                if(opciones&lecturas::Armadura) {
-                    int valor=-1;
-                    if(LeerSeguro(personaje+campos::armadura,valor)&&valor>=0&&valor<=100) p.armadura=valor;
-                    p.casco=objetos&&LeerEstado(objetos+campos::casco);
+                struct Equipo { std::uint8_t kit=0,casco=0; } equipo;
+                static_assert(campos::casco-campos::kit==offsetof(Equipo,casco));
+                if(objetos&&LeerSeguro(objetos+campos::kit,equipo)) {
+                    p.casco=(opciones&lecturas::Casco)&&equipo.casco==1;
+                    p.kit=(opciones&lecturas::Kit)&&equipo.kit==1;
                 }
-                if(opciones&lecturas::Kit) p.kit=objetos&&LeerEstado(objetos+campos::kit);
             }
             guardado.datosLentosLeidosEn=ahora;
         }
-        if ((opciones&lecturas::Portador)&&(!mismoJugador||opcionesCambiadas||ahora-guardado.inventarioLeidoEn>=150)) {
-            p.llevaBomba=LlevaBomba(personaje,listaEntidades); guardado.inventarioLeidoEn=ahora;
+        if ((opciones&lecturas::Portador)&&(!mismoJugador||opcionesCambiadas||ahora-guardado.inventarioLeidoEn>=250)) {
+            p.llevaBomba=LlevaBomba(personaje,listaEntidades);
+            guardado.inventarioLeidoEn=ahora;
         }
 
         // La pose se obtiene durante el dibujo, no en estos datos compartidos.
@@ -806,12 +742,12 @@ static void ActualizarJugadores() {
     datosLeidosEn=GetTickCount64();
 }
 
-// Función del hilo de lectura de memoria
+// Lectura de poses desde el hilo de dibujo.
 bool LeerPoseJugador(DatosJugador& jugador,PoseJugador& pose) {
 
     struct EstadoPose { validacion::Reintento reintento; std::uint64_t usadoEn=0; };
     static std::array<EstadoPose,65> reintentos{};
-    // Llamar desde un único hilo consumidor; la caché de reintentos no es compartida.
+    // Se usa exclusivamente desde el hilo de dibujo.
     const auto ahora=GetTickCount64();
     auto entrada=std::find_if(reintentos.begin(),reintentos.end(),[&](const EstadoPose& e) {
         return e.reintento.identidad==jugador.personaje;
@@ -823,9 +759,8 @@ bool LeerPoseJugador(DatosJugador& jugador,PoseJugador& pose) {
     if(!reintento.Disponible(jugador.personaje,ahora)) { pose={}; return false; }
     bool correcto=false;
     struct Registrar { validacion::Reintento& r; bool& ok; uint64_t ahora; ~Registrar(){r.Resultado(ok,ahora);} } registrar{reintento,correcto,ahora};
-    const auto escena=pose.escena ? pose.escena : Leer<uintptr_t>(jugador.personaje+campos::nodoEscena);
+    const auto escena=Leer<uintptr_t>(jugador.personaje+campos::nodoEscena);
     pose={};
-    pose.escena=escena;
     if (!escena) return false;
     Vector3 origen;
     if (!LeerSeguro(escena+campos::origenAbsoluto,origen)||
@@ -920,13 +855,13 @@ static void ActualizarEspectadores() {
 static void EjecutarHiloMemoria() {
     try {
     while (memoriaActiva.load()) {
-        if (JuegoEnPausa()) {
-            // Suspender las lecturas; al reanudar se vuelve a comprobar la partida.
-            if(estadoPartida.load()!=EstadoPartida::Fuera) {
+        if (JuegoEnPausa()||!VisualesActivos()) {
+            // Invalidar las muestras al pausar; al volver se comprueba la conexión.
+            if(EstadoPublicado()!=EstadoPartida::Fuera) {
                 PublicarEstadoPartida(EstadoPartida::Fuera); VaciarDatosJugadores(); sondeoPartida={};
             }
             std::unique_lock<std::mutex> bloqueo(mutexSuspension);
-            despertarLector.wait(bloqueo,[] { return !JuegoEnPausa()||!memoriaActiva.load(); });
+            despertarLector.wait(bloqueo,[] { return (!JuegoEnPausa()&&VisualesActivos())||!memoriaActiva.load(); });
             continue;
         }
         const auto comienzo=std::chrono::steady_clock::now();
@@ -947,13 +882,9 @@ static void EjecutarHiloMemoria() {
         // El trabajo forma parte del intervalo; ceder al menos 1 ms tras un ciclo lento.
         std::unique_lock<std::mutex> bloqueo(mutexSuspension);
         despertarLector.wait_until(bloqueo,(std::max)(comienzo+intervalo,std::chrono::steady_clock::now()+std::chrono::milliseconds(1)),
-            [] { return JuegoEnPausa()||!memoriaActiva.load(); });
+            [] { return JuegoEnPausa()||!VisualesActivos()||!memoriaActiva.load(); });
     }
-    } catch (const std::exception& error) {
-        errores::Error(std::string("El lector se detuvo: ")+error.what());
-        PublicarEstadoPartida(EstadoPartida::Desconocido);VaciarDatosJugadores(); memoriaActiva=false;
     } catch (...) {
-        errores::Error("El lector se detuvo por un error desconocido.");
         PublicarEstadoPartida(EstadoPartida::Desconocido);
         VaciarDatosJugadores();
         memoriaActiva = false;

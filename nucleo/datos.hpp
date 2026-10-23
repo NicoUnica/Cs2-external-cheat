@@ -5,15 +5,6 @@
 
 namespace extras {
 inline bool EsFinito(Vector3 p) { return std::isfinite(p.x)&&std::isfinite(p.y)&&std::isfinite(p.z); }
-struct ContadorImpactos {
-    uintptr_t personaje=0,servicio=0;
-    int impactos=0;
-    bool Actualizar(uintptr_t siguientePersonaje,uintptr_t siguienteServicio,int cantidad) {
-        const bool impacto=siguientePersonaje&&siguienteServicio&&personaje==siguientePersonaje&&servicio==siguienteServicio&&cantidad>impactos;
-        personaje=siguientePersonaje; servicio=siguienteServicio; impactos=cantidad;
-        return impacto;
-    }
-};
 struct EstadoBomba {
     Vector3 origen{};
     bool visible=false,plantada=false,tiempoValido=false,desactivando=false;
@@ -37,10 +28,9 @@ extras::Instantanea CopiarDatosExtras();
 namespace mundo {
 enum class Tipo { Ninguno,Arma,HE,Flash,Humo,Molotov,Senuelo,Fuego };
 struct Objeto {
-    Vector3 origen{},velocidad{};
+    Vector3 origen{};
     Tipo tipo=Tipo::Ninguno;
     float restante=-1;
-    int balasCargador=-1,balasReserva=-1;
     std::array<char,64> nombre{};
 };
 struct Cuadro { std::uint64_t leidoEn=0; std::vector<Objeto> objetos; };
